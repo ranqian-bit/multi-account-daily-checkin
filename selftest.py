@@ -13,7 +13,9 @@ CLEAN_KEYS = ("WORKBUDDY_ACCESS_TOKEN", "WORKBUDDY_UID", "WORKBUDDY_AUTH_FILE",
               "HOME",
               # 多账号相关
               "WORKBUDDY_ACCOUNT", "WORKBUDDY_CONFIG_DIR", "CODEBUDDY_CONFIG_DIR",
-              "WORKBUDDY_HOME", "CODEBUDDY_HOME", "WORKBUDDY_LOCK_FILE")
+              "WORKBUDDY_HOME", "CODEBUDDY_HOME", "WORKBUDDY_LOCK_FILE",
+              # 时间随机化
+              "WORKBUDDY_JITTER_SECONDS", "INVOCATION_ID")
 
 def run(args, env=None, label="", isolate=True):
     """isolate=True 时把家目录指到临时目录，避免读到本机真实凭据。"""
@@ -256,6 +258,54 @@ with tempfile.TemporaryDirectory() as d:
                   label="18. 非账号模式 / 全局落点自动探测（向后兼容）")
     assert rc == 0, "单账号模式应仍能自动探测全局落点，实际 %d" % rc
     assert "len=33" in out
+
+# 19) 时间随机化：WORKBUDDY_JITTER_SECONDS 的解析与 systemd 环境下的安全上限。
+#     抖动只影响「真正发请求」的 claim，不影响离线 doctor；这里直接调用内部函数做确定性校验。
+import importlib.util as _iu
+_spec = _iu.spec_from_file_location("signin_linux_under_test", SCRIPT)
+_mod = _iu.module_from_spec(_spec)
+_spec.loader.exec_module(_mod)
+
+
+def _jit(val, systemd=False):
+    old_j = os.environ.pop("WORKBUDDY_JITTER_SECONDS", None)
+    old_i = os.environ.pop("INVOCATION_ID", None)
+    try:
+        if val is not None:
+            os.environ["WORKBUDDY_JITTER_SECONDS"] = val
+        if systemd:
+            os.environ["INVOCATION_ID"] = "test-invocation"
+        return _mod._jitter_seconds()
+    finally:
+        os.environ.pop("WORKBUDDY_JITTER_SECONDS", None)
+        os.environ.pop("INVOCATION_ID", None)
+        if old_j is not None:
+            os.environ["WORKBUDDY_JITTER_SECONDS"] = old_j
+        if old_i is not None:
+            os.environ["INVOCATION_ID"] = old_i
+
+
+print("--- 19. 抖动参数解析（--jitter / --no-jitter / systemd 上限） ---")
+for val, expect in [(None, 0), ("", 0), ("0", 0), ("off", 0), ("none", 0),
+                    ("abc", 0), ("-5", 0), ("1.9", 1),
+                    ("300", 300), ("18000", 18000), ("999999999", _mod.MAX_JITTER_SECONDS)]:
+    got = _jit(val)
+    print("  WORKBUDDY_JITTER_SECONDS=%-10r -> %d（期望 %d）" % (val, got, expect))
+    assert got == expect, "抖动解析错误：%r 得到 %d，期望 %d" % (val, got, expect)
+
+# 关键安全用例：在 systemd 服务里，大窗口必须被压到 TimeoutStartSec 之下，否则服务会被 SIGTERM
+_under_systemd = _jit("18000", systemd=True)
+print("  systemd 环境下 WORKBUDDY_JITTER_SECONDS=18000 -> %d（必须 <= %d）"
+      % (_under_systemd, _mod.SYSTEMD_JITTER_CAP))
+assert _under_systemd == _mod.SYSTEMD_JITTER_CAP, "systemd 环境必须压缩抖动窗口"
+assert _mod.SYSTEMD_JITTER_CAP < 900, "压缩后的窗口必须小于服务单元 TimeoutStartSec=900"
+
+# 抖动不得影响离线 doctor（否则会拖慢自检与监控）
+rc, out = run(["doctor", "--json"],
+              env={"WORKBUDDY_ACCESS_TOKEN": "FAKE.TOKEN.FOR.TEST", "WORKBUDDY_UID": "12345",
+                   "WORKBUDDY_JITTER_SECONDS": "18000"},
+              label="19b. doctor 不受抖动影响（即使窗口开到 5 小时也应立即返回）")
+assert rc == 0, "doctor 应退出码 0，实际 %d" % rc
 
 print("=" * 62)
 print("全部断言通过 ✅")

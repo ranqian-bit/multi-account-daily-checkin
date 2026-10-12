@@ -96,8 +96,8 @@ sudo ./install.sh
 ### 第 2 步：添加账号（有多少加多少）
 
 ```bash
-sudo ./install.sh --add-account acct1      # 第 1 个账号 → 自动定时 00:05
-sudo ./install.sh --add-account acct2      # 第 2 个账号 → 自动错峰到 00:35
+sudo ./install.sh --add-account acct1      # 第 1 个账号 → 窗口 [00:05, 05:05)
+sudo ./install.sh --add-account acct2      # 第 2 个账号 → 窗口 [05:05, 10:05)
 sudo ./install.sh --list                   # 查看账号、定时状态、上次日志
 ```
 
@@ -180,7 +180,7 @@ journalctl -u 'workbuddy-signin@acct1' -n 30 --no-pager
 | 目的 | 命令 |
 |------|------|
 | 安装共享部分 | `sudo ./install.sh` |
-| 添加账号 | `sudo ./install.sh --add-account <名> [--time HH:MM]` |
+| 添加账号 | `sudo ./install.sh --add-account <名> [--time HH:MM] [--window 秒]` |
 | 移除账号 | `sudo ./install.sh --remove-account <名>` |
 | 查看所有账号 | `sudo ./install.sh --list` |
 | 卸载（保留账号配置） | `sudo ./install.sh --uninstall` |
@@ -249,7 +249,7 @@ journalctl -u 'workbuddy-signin@acct1' -n 30 --no-pager
 | `login-cli.sh` | CodeBuddy CLI 登录驱动（tmux 伪终端 + 自动抓登录链接） |
 | `audit-accounts.sh` | **多账号体检**：列出各账号身份（昵称 + uid），揪出「两个账号其实是同一个人」 |
 | `set-token.sh` | 明文令牌安全注入（按账号） |
-| `selftest.py` | 本地自测，19 组用例（凭据解析 / 信封 / 过期 / 白名单 / **独立 HOME 隔离与「不回落全局凭据」防线** / 锁） |
+| `selftest.py` | 本地自测，19 组用例（凭据解析 / 信封 / 过期 / 白名单 / **独立 HOME 隔离与「不回落全局凭据」防线** / 锁 / **抖动参数与 systemd 安全上限**） |
 | `selftest-server.sh` | **服务器侧**自测，13 项：专测 shell 包装层（`set -a` 坑）、独立 HOME 凭据读取、账号隔离（不串号）与定时器 |
 | `README.md` | 本文档 |
 | `部署记录.md` | 本次在服务器上的实际部署与验证记录 |
@@ -280,13 +280,41 @@ TimeoutStartSec=900
 # /etc/systemd/system/workbuddy-signin@acct2.timer.d/10-schedule.conf
 [Timer]
 OnCalendar=
-OnCalendar=*-*-* 00:35:00
-RandomizedDelaySec=300
+OnCalendar=*-*-* 05:05:00     # 窗口起点
+RandomizedDelaySec=18000      # 窗口大小：5 小时
+AccuracySec=1s
 Persistent=true
 ```
 
+### 签到时刻是随机的（重要）
+
+固定钟点是最容易被服务端日志一眼认出的机器特征，所以**每个账号拿到的不是一个时间点，
+而是一个随机窗口**：实际签到时刻 = 窗口起点 + `random(0, 窗口)`。
+
+| 账号 | 窗口 | 含义 |
+|---|---|---|
+| acct1 | `[00:05, 05:05)` | 每天在这 5 小时里随机挑一刻签 |
+| acct2 | `[05:05, 10:05)` | 同上，且与 acct1 **永不重叠** |
+| acct3 | `[10:05, 15:05)` | 依此类推，每加一个账号往后顺延一个窗口 |
+
+- 窗口大小用 `--add-account <名> --window 18000` 指定（秒），默认 5 小时
+- `AccuracySec=1s`：关掉 systemd 默认的 1 分钟省电合并窗口，
+  让随机性只来自 `RandomizedDelaySec` 这一个来源
+- **想回到旧的「固定时刻 ±5 分钟」行为**：`--window 300`
+- 窗口起点都在**当天靠前的位置**（最晚 10:05），万一那次请求失败，
+  当天还剩十几个小时可以人工补一次，不至于断签
+
+**无 systemd 的降级路径（cron）**：cron 只能定固定钟点，所以
+`install.sh` 会把窗口大小写进账号配置的 `WORKBUDDY_JITTER_SECONDS`，
+由**脚本内部**在执行 `claim` 前 `sleep random(0, 窗口)` 补上随机性。
+两种路径都是「每天一个不同时刻」，不会一年到头都卡在同一个钟点上。
+
+> 装 systemd 时不启用 `WORKBUDDY_JITTER_SECONDS`：延迟若发生在服务进程里会占用
+> `TimeoutStartSec=900`，超时会被 SIGTERM。systemd 路径的随机性由 Timer 的
+> `RandomizedDelaySec` 负责（延迟发生在 timer 侧，不占服务超时）。
+> 代码里另有一道兜底：万一在 systemd 环境检测到超大窗口，会自动压到 600 秒并打印告警。
+
 - `Persistent=true`：关机/宕机错过的执行，开机后补跑
-- `RandomizedDelaySec=300`：±5 分钟随机抖动
 - 无 systemd 时自动降级为 `/etc/cron.d/workbuddy-signin`
 
 ### 自动续期是怎么工作的

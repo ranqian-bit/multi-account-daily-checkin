@@ -6,7 +6,7 @@
 #     sudo ./install.sh
 #
 #   账号管理：
-#     sudo ./install.sh --add-account 账号名 [--time HH:MM]
+#     sudo ./install.sh --add-account 账号名 [--time HH:MM] [--window 秒]
 #     sudo ./install.sh --remove-account 账号名
 #     sudo ./install.sh --list
 #     sudo ./install.sh --uninstall [--purge]
@@ -24,6 +24,13 @@
 #   每个账号的 systemd 服务在每次签到前会跑一次 refresh.sh，
 #   refreshToken 剩余不足 20 天时就用它滚动换新（约每 10 天一次），
 #   因此登录一次即可长期免扫码。
+#
+#   随机化：签到时刻不固定，避免长年累月都落在同一个钟点上。
+#     systemd  —— 每个账号分到一个互不重叠的随机窗口，窗口内均匀随机取时刻：
+#                 acct1 [00:05,05:05)  acct2 [05:05,10:05)  acct3 [10:05,15:05) …
+#                 （窗口大小由 --window 决定，默认 18000 秒 = 5 小时）
+#     无 systemd（cron 降级）—— cron 记在窗口起点，脚本内再随机延迟 0..窗口 秒
+#     想回到旧的「固定时刻 ±5 分钟」：--window 300
 #
 #   隔离设计：每个账号拥有各自的
 #     凭据文件  /etc/workbuddy-signin/accounts/<名>.env
@@ -47,7 +54,11 @@ RUN_NAME="run.sh"
 REFRESH_RUN_NAME="refresh.sh"
 SERVICE_TMPL="workbuddy-signin@"
 DEFAULT_TIME="00:05"
-STAGGER_MINUTES=30
+# 每个账号的随机签到窗口（秒）：窗口内均匀随机取时刻，而不是固定钟点。
+# 18000 = 5 小时；账号之间按窗口顺序切分，互不重叠。
+SCHEDULE_WINDOW=18000
+# 第 1 个账号的窗口起点（00:05，避开 00:00 整点的对账竞争）
+WINDOW_START_MINUTES=5
 
 INSTALL_DIR=""
 ACTION="install"
@@ -66,12 +77,20 @@ while [ $# -gt 0 ]; do
     --remove-account) ACTION="remove"; ACCOUNT="${2:?--remove-account 需要账号名}"; shift 2 ;;
     --list)           ACTION="list"; shift ;;
     --time)           SCHEDULE_TIME="${2:?--time 需要 HH:MM}"; shift 2 ;;
+    --window)         SCHEDULE_WINDOW="${2:?--window 需要秒数}"; shift 2 ;;
     --uninstall)      ACTION="uninstall"; shift ;;
     --purge)          PURGE=1; shift ;;
-    -h|--help)        sed -n '2,26p' "$0"; exit 0 ;;
+    -h|--help)        sed -n '2,33p' "$0"; exit 0 ;;
     *)                die "未知参数：$1（--help 查看用法）" ;;
   esac
 done
+
+# 随机窗口必须是正整数秒（例如 --window 18000 / --window 300）
+case "$SCHEDULE_WINDOW" in
+  ''|*[!0-9]*) die "--window 需要正整数秒数，收到：$SCHEDULE_WINDOW" ;;
+esac
+[ "$SCHEDULE_WINDOW" -gt 0 ] || die "--window 必须大于 0 秒"
+[ "$SCHEDULE_WINDOW" -le 43200 ] || warn "--window 超过 12 小时，窗口会跨到次日、并与其它账号重叠"
 
 # ---------------------------------------------------------------- 环境探测
 IS_ROOT=0
@@ -347,8 +366,12 @@ EOF
 Description=WorkBuddy 签到定时器（账号 %i）
 
 [Timer]
+# 默认窗口起点；每个账号的实际时间由 drop-in 覆盖，并在窗口内随机取时刻
 OnCalendar=*-*-* $DEFAULT_TIME:00
-RandomizedDelaySec=300
+# 在窗口内均匀随机延迟：签到时刻每天不同，不形成固定钟点特征
+RandomizedDelaySec=$SCHEDULE_WINDOW
+# 不用 systemd 的省电合并窗口（默认 1 分钟），让随机性只来自上面这一个来源
+AccuracySec=1s
 Persistent=true
 Unit=${SERVICE_TMPL}%i.service
 
@@ -362,27 +385,45 @@ EOF
   fi
 }
 
+# 幂等地写入/更新账号配置里的某个键（已有同名键会被替换）。用于给 cron 路径开抖动。
+set_env_var() {
+  _f="$1"; _k="$2"; _v="$3"
+  [ -f "$_f" ] || return 0
+  grep -v "^${_k}=" "$_f" > "$_f.tmp" 2>/dev/null || true
+  printf '%s=%s\n' "$_k" "$_v" >> "$_f.tmp"
+  cat "$_f.tmp" > "$_f"
+  rm -f "$_f.tmp"
+  chmod 600 "$_f" 2>/dev/null || true
+}
+
 setup_account_schedule() {
   acct="$1"; time="$2"
   hh="${time%%:*}"; mm="${time##*:}"
-  hh=$((10#$hh)); mm=$((10#$mm))
+  hh_num=$((10#$hh)); mm_num=$((10#$mm))
+  # systemd 的 OnCalendar 用零填充；cron 的分钟/小时字段不能用前导零（有被当八进制的风险）
+  hh="$(printf '%02d' "$hh_num")"; mm="$(printf '%02d' "$mm_num")"
 
   if [ "$HAVE_SYSTEMD" -eq 1 ]; then
     DROPIN="/etc/systemd/system/$(account_timer "$acct").d"
     mkdir -p "$DROPIN"
     cat > "$DROPIN/10-schedule.conf" <<EOF
-# 由 install.sh --add-account 生成：账号 $acct 的签到时间（错峰，避免多账号同时请求）
+# 由 install.sh --add-account 生成：账号 $acct 的签到窗口
+# 窗口 = [$time, $time + $SCHEDULE_WINDOW 秒)，实际签到时刻在窗口内均匀随机，
+# 每天不同；各账号的窗口互不重叠，避免多账号同时请求。
 [Timer]
 OnCalendar=
 OnCalendar=*-*-* $hh:$mm:00
-RandomizedDelaySec=300
+RandomizedDelaySec=$SCHEDULE_WINDOW
+AccuracySec=1s
 Persistent=true
 EOF
     systemctl daemon-reload
     systemctl enable --now "$(account_timer "$acct")" >/dev/null
-    log "定时器已启用：$(account_timer "$acct")（每天 $time ± 300s，Persistent=true）"
+    log "定时器已启用：$(account_timer "$acct")（$time 起 $SCHEDULE_WINDOW 秒窗口内随机，Persistent=true）"
   else
-    LINE="$mm $hh * * * $INSTALL_DIR/$RUN_NAME $acct claim >/dev/null 2>&1"
+    # cron 只能定在固定钟点：把窗口起点交给 cron，窗口内的随机性由脚本内抖动补上
+    set_env_var "$CRED_DIR/$acct.env" WORKBUDDY_JITTER_SECONDS "$SCHEDULE_WINDOW"
+    LINE="$mm_num $hh_num * * * $INSTALL_DIR/$RUN_NAME $acct claim >/dev/null 2>&1"
     if [ "$IS_ROOT" -eq 1 ]; then
       CRONFILE="/etc/cron.d/workbuddy-signin"
       touch "$CRONFILE"
@@ -401,6 +442,7 @@ EOF
       printf '%s\n%s\n' "$EXIST" "$LINE" | crontab -
       log "已写入当前用户 crontab：$LINE"
     fi
+    log "窗口内随机延迟由脚本内抖动实现（WORKBUDDY_JITTER_SECONDS=$SCHEDULE_WINDOW）"
   fi
 }
 
@@ -436,6 +478,12 @@ WORKBUDDY_UID=
 # ---- 方式 B：直接指向明文凭据 JSON 文件（可选，优先于自动探测）----
 # WORKBUDDY_AUTH_FILE=$ACCT_HOME_BASE-$acct/.local/share/CodeBuddyExtension/Data/Public/auth/Tencent-Cloud.coding-copilot.info
 
+# ---- 高级：执行前随机抖动上限（秒）。留空 = 不抖动 ----
+# systemd 定时器本身已在窗口内随机，通常无需设置；
+# 只有用 cron / 手动等「固定时刻」调度时才需要设成窗口大小，让签到钟点不固定。
+# 在 systemd 服务里该值会被自动压到 600 秒以内（避免触发 TimeoutStartSec）。
+# WORKBUDDY_JITTER_SECONDS=
+
 # ---- 高级：接口地址（默认官方，请勿修改）----
 # WORKBUDDY_API_BASE=https://copilot.tencent.com
 EOF
@@ -456,8 +504,9 @@ if [ "$ACTION" = "add" ]; then
   if [ -z "$SCHEDULE_TIME" ]; then
     idx=0
     for _a in $(existing_accounts); do idx=$(( idx + 1 )); done
-    SCHEDULE_TIME="$(hhmm_from_minutes $(( 5 + STAGGER_MINUTES * idx )))"
-    log "未指定 --time，按第 $(( idx + 1 )) 个账号自动错峰为 $SCHEDULE_TIME"
+    # 给每个账号切一个互不重叠的随机窗口：[起点, 起点 + 窗口)
+    SCHEDULE_TIME="$(hhmm_from_minutes $(( WINDOW_START_MINUTES + (SCHEDULE_WINDOW / 60) * idx )))"
+    log "未指定 --time，第 $(( idx + 1 )) 个账号分到窗口起点 $SCHEDULE_TIME（窗口 ${SCHEDULE_WINDOW}s 内随机）"
   fi
   case "$SCHEDULE_TIME" in
     [0-9]:[0-9][0-9]|0[0-9]:[0-9][0-9]|1[0-9]:[0-9][0-9]|2[0-3]:[0-9][0-9]) ;;
@@ -489,7 +538,8 @@ install_shared
 
 echo
 log "共享部分安装完成。接下来为每个账号执行："
-echo "  $0 --add-account <账号名>          # 可重复执行，自动错峰定时"
+echo "  $0 --add-account <账号名>          # 可重复执行，自动分配互不重叠的随机窗口"
+echo "  $0 --add-account <账号名> --window 18000   # 自定义窗口大小（秒，默认 5 小时）"
 echo "  $0 --list                          # 查看所有账号与定时状态"
 if [ -n "$(existing_accounts)" ]; then
   log "已存在的账号：$(existing_accounts | tr '\n' ' ')"

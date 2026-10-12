@@ -56,6 +56,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import random
 import ssl
 import sys
 import time
@@ -710,6 +711,40 @@ def _budget_seconds() -> int:
     return min(value, MAX_BUDGET_SECONDS)
 
 
+MAX_JITTER_SECONDS = 12 * 3600
+# systemd 服务单元 TimeoutStartSec=900，若在服务里 sleep 太久会被 SIGTERM。
+# systemd 路径本应使用 Timer 的 RandomizedDelaySec（延迟发生在 timer 侧，不占超时），
+# 这里只是兜底：万一有人把大窗口写进了 systemd 环境，自动压回安全值而不是让服务被杀。
+SYSTEMD_JITTER_CAP = 600
+
+
+def _jitter_seconds() -> int:
+    """执行前随机抖动的上限（秒），默认 0 = 不抖动。
+
+    调度器本身通常已有随机窗口（systemd 的 RandomizedDelaySec）；
+    这个开关是给「固定时刻」的调度方式（cron / 手动 / 外部定时服务）用的第二层保险：
+    每次实际发起请求的时刻 = 计划时刻 + random(0, 上限)，
+    避免长年累月都落在同一个钟点上，形成一眼可辨的机器特征。
+    """
+    raw = os.environ.get("WORKBUDDY_JITTER_SECONDS", "").strip()
+    if not raw or raw.lower() in ("0", "off", "none", "no"):
+        return 0
+    try:
+        value = int(float(raw))
+    except ValueError:
+        return 0
+    if value <= 0:
+        return 0
+    value = min(value, MAX_JITTER_SECONDS)
+    if os.environ.get("INVOCATION_ID") and value > SYSTEMD_JITTER_CAP:
+        sys.stderr.write(
+            "[抖动] 检测到 systemd 环境，窗口由 %d 秒压到 %d 秒"
+            "（避免触发 TimeoutStartSec，systemd 请改用 Timer 的 RandomizedDelaySec）\n"
+            % (value, SYSTEMD_JITTER_CAP))
+        value = SYSTEMD_JITTER_CAP
+    return value
+
+
 def _log_path() -> Optional[Path]:
     raw = os.environ.get("WORKBUDDY_SIGNIN_LOG", "").strip()
     if raw.lower() in ("0", "off", "none"):
@@ -735,6 +770,8 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
     parser.add_argument("--json", action="store_true", help="输出单行 JSON，便于监控采集")
     parser.add_argument("--ignore-expiry", action="store_true",
                         help="忽略凭据里的 expiresAt 过期预检（该字段不可信时用）")
+    parser.add_argument("--no-jitter", action="store_true",
+                        help="本次不做随机抖动（忽略 WORKBUDDY_JITTER_SECONDS）")
     return parser.parse_args(argv)
 
 
@@ -744,6 +781,17 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     if args.action == "doctor":
         return cmd_doctor(args.json)
+
+    # 随机抖动：让每次实际发起请求的时刻不固定。
+    # 默认关闭；定时方式本身已随机的场合（systemd RandomizedDelaySec）无需开启。
+    if args.action == "claim" and not args.no_jitter:
+        window = _jitter_seconds()
+        if window:
+            delay = random.uniform(0, window)
+            sys.stderr.write("[抖动] 随机延迟 %.0f 秒后发起请求（窗口 0..%d 秒）\n"
+                             % (delay, window))
+            sys.stderr.flush()
+            time.sleep(delay)
 
     try:
         with Lock(_lock_path()):
