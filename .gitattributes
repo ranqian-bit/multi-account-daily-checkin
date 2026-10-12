@@ -1,0 +1,13 @@
+# 强制脚本类文件以 LF 存储在仓库中。
+# 否则 Windows 上 core.autocrlf=true 时，.sh 可能带 CRLF 落盘，
+# 传到 Linux 后 `#!/usr/bin/env bash` 会因 \r 报错（bad interpreter）。
+*.sh   text eol=lf
+*.py   text eol=lf
+*.env  text eol=lf
+
+*.md   text eol=lf
+
+# 二进制/其他
+*.png  binary
+*.jpg  binary
+*.gz   binary

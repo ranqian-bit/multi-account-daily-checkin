@@ -1,0 +1,41 @@
+# ---- 凭据与密钥：任何情况下都不要提交 ----
+*.env
+*.env.*
+!*.env.example
+credentials*
+*credential*
+*.info
+*.pem
+*.key
+*.p12
+*.pfx
+
+# ---- 备份与临时文件 ----
+*.bak
+*.bak-*
+*.bak.*
+*.orig
+*.tmp
+*.log
+*.swp
+*~
+
+# ---- 本地敏感备注（含真实 IP / 账号名等原文）----
+请勿上传-真实信息备查.md
+.local-only/
+.private/
+
+# ---- 运行时产物 ----
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+env/
+
+# ---- 编辑器 / 系统 ----
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
