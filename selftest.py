@@ -307,5 +307,89 @@ rc, out = run(["doctor", "--json"],
               label="19b. doctor 不受抖动影响（即使窗口开到 5 小时也应立即返回）")
 assert rc == 0, "doctor 应退出码 0，实际 %d" % rc
 
+# =============================================================================
+# 20. 401 自愈：AUTH_REJECTED 时强制续期并重试一次（2026-10-24 事故的修复）
+#     服务端偶发把会话判无效（APISIX 网关层 401），refreshToken 还活着时
+#     强制续期即可自愈；refreshToken 也死了则必须重新登录。
+# =============================================================================
+import subprocess as _sp
+from types import SimpleNamespace as _NS
+
+print("--- 20. 401 自愈（强制续期 + 重试） ---")
+
+
+class _FakeRun:
+    """替身：拦截 _self_heal_refresh 里的 subprocess.run。"""
+
+    def __init__(self, payload, rc=0):
+        self.payload, self.rc = payload, rc
+
+    def __call__(self, *a, **kw):
+        self.argv = a[0] if a else kw.get("args")
+        self.kw = kw
+        return _NS(stdout=self.payload, stderr="", returncode=self.rc)
+
+
+def _heal_with(fake, account=True):
+    saved = _mod.subprocess.run
+    _mod.subprocess.run = fake
+    old_acct = os.environ.get("WORKBUDDY_ACCOUNT")
+    old_tok = os.environ.pop("WORKBUDDY_ACCESS_TOKEN", None)
+    if account:
+        os.environ["WORKBUDDY_ACCOUNT"] = "acct1"      # 账号模式
+    else:
+        os.environ.pop("WORKBUDDY_ACCOUNT", None)
+    os.environ["WORKBUDDY_ACCESS_TOKEN"] = "STALE.OLD.TOKEN"
+    try:
+        return _mod._self_heal_refresh()
+    finally:
+        _mod.subprocess.run = saved
+        if old_acct is not None:
+            os.environ["WORKBUDDY_ACCOUNT"] = old_acct
+        else:
+            os.environ.pop("WORKBUDDY_ACCOUNT", None)
+        if old_tok is not None:
+            os.environ["WORKBUDDY_ACCESS_TOKEN"] = old_tok
+        else:
+            os.environ.pop("WORKBUDDY_ACCESS_TOKEN", None)
+
+
+# 用例 1：非账号模式 → 不自愈
+ok, why = _heal_with(_FakeRun("{}", rc=0), account=False)
+assert ok is False and "非账号模式" in why, "非账号模式不应自愈：%r" % (why,)
+print("  ✓ 非账号模式跳过自愈")
+
+# 用例 2：账号模式 + 续期成功 → True，且环境变量旧令牌被清掉（重试改读凭据文件）
+ok, why = _heal_with(_FakeRun('{"result":"REFRESHED","ok":true,"report":"续期成功"}', rc=0))
+assert ok is True, "REFRESHED 应判定自愈成功：%r" % (why,)
+print("  ✓ 续期成功 → 自愈成立（%s）" % why)
+
+# 用例 3：续期脚本返回 REFRESH_FAILED → False，且带回原因
+ok, why = _heal_with(_FakeRun('{"result":"REFRESH_FAILED","ok":false,'
+                              '"report":"等了 150 秒仍未见新令牌"}', rc=1))
+assert ok is False and "150 秒" in why, "REFRESH_FAILED 应失败并带原因：%r" % (why,)
+print("  ✓ 续期失败 → 不自愈（%s）" % why)
+
+# 用例 4：输出里没有 JSON → False（不能崩）
+ok, why = _heal_with(_FakeRun("garbage output", rc=0))
+assert ok is False, "无 JSON 输出应判失败"
+print("  ✓ 无 JSON 输出 → 安全失败")
+
+# 用例 5：调用参数必须是「同目录 refresh_token.py + --force + --json」
+fake = _FakeRun('{"result":"REFRESHED","ok":true}', rc=0)
+_heal_with(fake)
+assert fake.argv == [sys.executable, str(HERE / "refresh_token.py"), "--force", "--json"], \
+    "续期调用参数不对：%r" % (fake.argv,)
+assert fake.kw.get("timeout") == 480, "应有 480 秒超时保护"
+print("  ✓ 调用参数与超时正确")
+
+# 用例 6（源码级）：main 的重试循环存在 —— AUTH_REJECTED 且未自愈过才触发，
+# 自愈成功要 continue 重试；救不回来时报告必须写明重新登录的方法。
+src = SCRIPT.read_text(encoding="utf-8")
+assert "healed = False" in src and 'exc.result == "AUTH_REJECTED"' in src \
+    and "healed = True" in src and "login-cli.sh" in src, "main 缺少自愈重试循环"
+assert src.count("_self_heal_refresh") >= 2, "自愈函数未被调用"
+print("  ✓ main 含自愈重试循环（AUTH_REJECTED → 续期 → 重试一次 → 明确告警）")
+
 print("=" * 62)
 print("全部断言通过 ✅")

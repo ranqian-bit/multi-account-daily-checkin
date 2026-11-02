@@ -58,6 +58,7 @@ import json
 import os
 import random
 import ssl
+import subprocess
 import sys
 import time
 import urllib.error
@@ -775,6 +776,54 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def _self_heal_refresh() -> Tuple[bool, str]:
+    """401 自愈：调用同目录的 refresh_token.py 强制续期，成功返回 True。
+
+    背景：服务端偶尔会把会话判无效（实测 APISIX 网关层 401，HTML 响应体），
+    而 refreshToken 本身还活着 —— 这时强制续期换一枚新 accessToken 就能自愈，
+    不需要人工重新登录（实测 2026-10-18 与 2026-10-24 各发生过一次）。
+    若 refreshToken 也死了，续期必然失败，只能 login-cli.sh 重新扫码。
+
+    只在多账号模式下启用（需要账号 env 提供的 WORKBUDDY_HOME 等上下文）。
+    续期成功后清掉环境变量里的旧令牌，让重试时改读凭据文件 —— 否则
+    环境变量优先级更高，重试还会拿旧令牌再撞一次 401。
+    """
+    acct = os.environ.get("WORKBUDDY_ACCOUNT", "").strip()
+    if not acct:
+        return False, "非账号模式（未设 WORKBUDDY_ACCOUNT），跳过自愈"
+    script = Path(__file__).resolve().parent / "refresh_token.py"
+    if not script.is_file():
+        return False, "同目录找不到 refresh_token.py，跳过自愈"
+    try:
+        proc = subprocess.run(
+            [sys.executable, str(script), "--force", "--json"],
+            capture_output=True, text=True, timeout=480)
+    except subprocess.TimeoutExpired:
+        return False, "续期进程超时（480 秒）"
+    except Exception as exc:  # noqa: BLE001
+        return False, "续期进程异常（%s）" % type(exc).__name__
+
+    out = ((proc.stdout or "") + (proc.stderr or "")).strip()
+    result, report = "", ""
+    for line in reversed(out.splitlines()):        # 取最后一条 JSON 记录
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            j = json.loads(line)
+        except ValueError:
+            continue
+        result = str(j.get("result") or "")
+        report = str(j.get("report") or "")[:160]
+        break
+    if proc.returncode != 0 or result != "REFRESHED":
+        return False, report or ("续期未成功（result=%s, exit=%d）"
+                                 % (result or "?", proc.returncode))
+
+    os.environ.pop("WORKBUDDY_ACCESS_TOKEN", None)   # 强制重试改读凭据文件
+    return True, "强制续期成功（%s）" % report
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     args = parse_args(argv if argv is not None else sys.argv[1:])
     log_path = _log_path()
@@ -794,40 +843,59 @@ def main(argv: Optional[List[str]] = None) -> int:
             time.sleep(delay)
 
     try:
-        with Lock(_lock_path()):
-            creds, _looked = load_credentials()
-            headers = build_headers(creds)
-            endpoint = resolve_endpoint()
-            budget = Budget(_budget_seconds())
+        healed = False
+        while True:
+            try:
+                with Lock(_lock_path()):
+                    creds, _looked = load_credentials()
+                    headers = build_headers(creds)
+                    endpoint = resolve_endpoint()
+                    budget = Budget(_budget_seconds())
 
-            # 过期预检：本地就能判定，省掉一次必然失败的请求
-            expiry_text, expired = describe_expiry(creds.get("auth") or {})
-            if expired and not args.ignore_expiry:
-                raise Fail("TOKEN_EXPIRED",
-                           "%s。请重新注入明文令牌（加 --ignore-expiry 可跳过本预检）。"
-                           % expiry_text, 2)
+                    # 过期预检：本地就能判定，省掉一次必然失败的请求
+                    expiry_text, expired = describe_expiry(creds.get("auth") or {})
+                    if expired and not args.ignore_expiry:
+                        raise Fail("TOKEN_EXPIRED",
+                                   "%s。请重新注入明文令牌（加 --ignore-expiry 可跳过本预检）。"
+                                   % expiry_text, 2)
 
-            if args.action == "status":
-                status = do_status(endpoint, headers, budget)
-                payload = {"result": "STATUS", **_pick(status, STATUS_KEYS)}
-                checked = status.get("today_checked_in")
-                payload["report"] = ("今日已签（连续 %s 天，累计 %s 积分）。"
-                                     % (status.get("streak_days"), status.get("total_credits"))
-                                     if checked else "今日尚未签到。")
-            else:
-                payload = do_claim(endpoint, headers, budget)
+                    if args.action == "status":
+                        status = do_status(endpoint, headers, budget)
+                        payload = {"result": "STATUS", **_pick(status, STATUS_KEYS)}
+                        checked = status.get("today_checked_in")
+                        payload["report"] = ("今日已签（连续 %s 天，累计 %s 积分）。"
+                                             % (status.get("streak_days"), status.get("total_credits"))
+                                             if checked else "今日尚未签到。")
+                    else:
+                        payload = do_claim(endpoint, headers, budget)
 
-            if expiry_text:
-                payload["token_expiry"] = expiry_text
-                payload["report"] = "%s %s" % (payload.get("report", ""), "（%s）" % expiry_text)
-            payload["ok"] = True
-            emit(payload, args.json, log_path)
-            return 0
+                    if expiry_text:
+                        payload["token_expiry"] = expiry_text
+                        payload["report"] = "%s %s" % (payload.get("report", ""), "（%s）" % expiry_text)
+                    payload["ok"] = True
+                    emit(payload, args.json, log_path)
+                    return 0
 
-    except Fail as exc:
-        emit({"ok": False, "result": exc.result, "report": str(exc),
-              "needs_attention": exc.exit_code not in (0,)}, args.json, log_path)
-        return exc.exit_code
+            except Fail as exc:
+                # 401 自愈：先强制续期再重试一次；救不回来才把"需要重新登录"写清楚。
+                # 没有这一步时，一次瞬时 401 就白白丢掉当天的积分（实测 2026-10-18）。
+                if (exc.result == "AUTH_REJECTED" and not healed
+                        and args.action in ("claim", "status")):
+                    sys.stderr.write("[自愈] 认证被拒，尝试强制续期后重试一次…\n")
+                    sys.stderr.flush()
+                    ok, why = _self_heal_refresh()
+                    sys.stderr.write("[自愈] %s\n" % why)
+                    sys.stderr.flush()
+                    if ok:
+                        healed = True
+                        continue
+                    acct = os.environ.get("WORKBUDDY_ACCOUNT", "").strip() or "账号"
+                    exc = Fail("AUTH_REJECTED",
+                               "服务端拒绝认证，且自动续期未能恢复（%s）。会话已失效，"
+                               "请重新登录：login-cli.sh %s" % (why, acct), 2)
+                emit({"ok": False, "result": exc.result, "report": str(exc),
+                      "needs_attention": exc.exit_code not in (0,)}, args.json, log_path)
+                return exc.exit_code
     except KeyboardInterrupt:
         emit({"ok": False, "result": "ABORTED", "report": "被用户中断。"}, args.json)
         return 130
@@ -836,7 +904,6 @@ def main(argv: Optional[List[str]] = None) -> int:
               "report": "脚本运行异常（%s: %s）" % (type(exc).__name__, exc)},
              args.json, log_path)
         return 1
-
 
 if __name__ == "__main__":
     raise SystemExit(main())
